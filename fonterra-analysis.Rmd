@@ -1,0 +1,635 @@
+---
+title: "Fonterra Social Media Analysis"
+output: 
+  html_document:
+    code_download: TRUE
+editor_options: 
+  chunk_output_type: console
+---
+
+## Overview
+
+This report analyses 9,001 Fonterra social media posts from six platforms (Facebook, Instagram, LinkedIn, TikTok, Twitter/X and YouTube), published between 2010 and 2026.
+
+The analysis has three parts:
+
+- **Data preparation:** cleaning the timestamps, media labels and missing engagement counts, and preparing the post text for analysis.
+- **Text analysis:** finding the most frequent words and using topic modelling (LDA, 6 topics) to see what Fonterra posts about.
+- **Engagement analysis:** comparing likes, comments and shares across platforms, media types and posting patterns.
+
+# Install and load packages and import and preview data
+
+```{r initia}
+# Set consistent options for tables and figures
+knitr::opts_chunk$set(fig.width = 8, fig.height = 5, echo = TRUE)
+
+# Install and load packages
+if(!require("pacman"))install.packages("pacman")
+pacman::p_load(readr, dplyr, tidyr, stringr, lubridate, purrr, ggplot2, gridExtra, GGally, corrplot,forcats,rstatix,DescTools, skimr, finalfit)
+pacman::p_load(tidytext, textstem, wordcloud, textdata, topicmodels, reshape2, 
+               knitr)
+          
+```
+
+```{r req_2a_1}
+# Import the Fonterra social media data
+raw_post_data <- read_csv(
+  "fonterra.csv",
+  na = c("", "NA"),
+  show_col_types = FALSE
+)
+
+# Preview the structure and first rows of the data
+glimpse(raw_post_data)
+head(raw_post_data)
+```
+
+# Data preparation
+
+## Non-text data
+
+There are some criteria taken into account during the non-text data cleaning:
+
+- `createdAt` variable was changed to UTC date-time, since according to the instruction, all the timestamps were collected in UTC time zone.
+- There are some timestamps with 00:00:00, which can be interpreted as date only without time information. Therefore, time will not be considered, only date-related features (year, month, weekday).
+- Likes and "digs" on TikTok are regarded as similar. Comments (except Twitter/X) and replies (Twitter/X) are also considered to be similar.
+- `media` feature contains different capitalisation (video, Video), so it should be standardised (Image, Video, Sidecar). Empty value was assigned Not recorded, rather than "no media", since media type cannot be determined.
+- High levels of engagement are maintained, since they probably are real examples of viral posts rather than outliers; rather than deleting them, medians and non-parametric tests are employed later on.
+- Posts without text are maintained during engagement analysis but deleted only when text analysis begins, since there will be nothing to tokenize then.
+- The missing engagements remain missing as opposed to using 0s since certain sites such as Instagram and YouTube do not provide the sharing metrics.
+- There are no duplicates in the form of identical rows or URLs. However, there is one instance where two posts have the same date and text for Facebook and Instagram (January 11, 2019, 06:00:24). This is not an error but cross-posting.
+
+```{r req_2a}
+# confirm all expected columns are present before cleaning
+necessary_cols <- c("platform", "url", "createdAt", "text", "media",
+                  "commentCount", "shareCount", "likeCount", "videoplayCount")
+stopifnot(all(necessary_cols %in% names(raw_post_data)))
+```
+
+```{r req_2b}
+# trim whitespace, parse the timestamp, and standardise the media labels
+posts <- raw_post_data |>
+  mutate(
+    platform   = str_squish(platform),
+    url        = str_squish(url),
+    createdAt  = ymd_hms(createdAt, tz = "UTC", quiet = TRUE),
+    post_media = case_when(
+      is.na(media)                             ~ "Not recorded",
+      str_to_lower(media) %in% c("photo", "image") ~ "Image",
+      str_to_lower(media) == "video"            ~ "Video",
+      str_to_lower(media) == "sidecar"          ~ "Sidecar",
+      TRUE ~ str_to_title(media)
+    )
+  )
+
+# confirm every timestamp parsed successfully
+stopifnot(sum(is.na(posts$createdAt)) == 0)
+```
+
+```{r req_2c}
+# check for exact duplicate rows and duplicate URLs
+tibble(
+  check  = c("Exact duplicate rows", "Duplicate URLs"),
+  number = c(sum(duplicated(posts)), sum(duplicated(posts$url)))
+) |>
+  kable(caption = "Duplicate checks")
+```
+
+```{r req_2d}
+# check for identical text posted at the exact same time, and which platforms
+posts |>
+  filter(!is.na(text)) |>
+  group_by(createdAt, text) |>
+  filter(n() > 1) |>
+  summarise(platforms = paste(platform, collapse = " & "), records = n(), .groups = "drop") |>
+  select(createdAt, platforms, records) |>
+  kable(caption = "Same-time, same-text records (kept as likely cross-posting)")
+```
+
+```{r req_2e}
+# missing values by column
+posts |>
+  summarise(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "missing") |>
+  mutate(pct_missing = round(100 * missing / nrow(posts), 1)) |>
+  kable(caption = "Missing values by column")
+```
+
+```{r req_2f}
+# check whether missing engagement counts are platform-specific
+posts |>
+  group_by(platform) |>
+  summarise(
+    missing_comments = sum(is.na(commentCount)),
+    missing_shares    = sum(is.na(shareCount)),
+    missing_plays     = sum(is.na(videoplayCount)),
+    .groups = "drop"
+  ) |>
+  kable(caption = "Missing engagement counts by platform")
+```
+
+```{r req_2g}
+# check for impossible negative counts
+posts |>
+  summarise(across(c(commentCount, shareCount, likeCount, videoplayCount),
+                    ~ sum(.x < 0, na.rm = TRUE))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "negative_values") |>
+  kable(caption = "Any impossible negative counts?")
+```
+
+## New variables created
+
+Why each new variable is useful:
+
+- `post_id` gives each post a unique identifier which is required for the text analysis and topic model.
+- `post_date`, `post_year`, `post_month`, `post_yearmonth` and `post_weekday` break the timestamp into components, so posting patterns can be examined without altering the original `createdAt`.
+- `post_media` is a tidy content-format label that can be compared against engagement.
+- `word_count` and `char_count` measure caption length, so length can be tested against engagement.
+- `total_reaction` sums whichever of likes/comments/shares a post has data for. It is a useful descriptive number but not the main cross-platform outcome, since shares are structurally missing on some platforms.
+- `has_play_data` flags the subset of posts where a plays-vs-likes comparison is possible.
+- `has_hashtag` flags whether a post used a `#` - a two-level variable used for a t-test/Mann-Whitney comparison later.
+
+```{r req_3ai}
+#new_variables
+posts <- posts |>
+  mutate(
+    post_id        = row_number(),
+    post_date      = as.Date(createdAt),
+    post_year      = year(createdAt),
+    post_month     = month(createdAt, label = TRUE, abbr = TRUE),
+    post_yearmonth = floor_date(createdAt, unit = "month"),
+    post_weekday   = wday(createdAt, label = TRUE, abbr = FALSE, week_start = 1),
+    word_count     = str_count(coalesce(text, ""), boundary("word")),
+    char_count     = str_length(coalesce(text, "")),
+    total_reaction = likeCount + coalesce(commentCount, 0) + coalesce(shareCount, 0),
+    has_play_data  = !is.na(videoplayCount),
+    has_hashtag    = str_detect(coalesce(text, ""), "#\\w+")
+  )
+
+# preview the new variables
+posts |>
+  select(post_id, platform, createdAt, post_year, post_month, post_weekday,
+         post_media, word_count, total_reaction, has_play_data) |>
+  head(10) |>
+  kable(caption = "New variables - first 10 rows")
+```
+
+The posts run from `r format(min(posts$post_date), "%d %B %Y")` to `r format(max(posts$post_date), "%d %B %Y")`. Because likes/comments/shares are cumulative counts rather than a rate over a fixed window, older posts have had more time to accumulate engagement than newer ones.
+
+## Text data
+
+Posts with no text content are excluded, as there is no data to tokenize. Links, @mentions, HTML artifacts, and the \# symbol are stripped before tokenization takes place, although the text within the \# symbol is usually kept, as it relates to the topic. Stop words, along with a few special dataset filler words, are excluded.Curly apostrophes have been converted into straight apostrophes to ensure that contractions like we’re are excluded from the list of stop words. No lemmatisation was performed; therefore, different forms of a word are considered independently, for example, award and awards.
+
+```{r req_3aii}
+# custom stop words: generic filler that adds no subject-matter meaning
+additional_stopwords <- tibble(
+  word = c("fonterra", "amp", "https", "http", "www", "com", "co",
+           "nz", "new", "zealand", "uh", "um", "yeah", "really",
+           "just", "know", "like", "good", "great", "thanks", "thank",
+           "hi", "hey", "cheers", "today", "year", "years", "day",
+           "time", "going", "make", "right", "week", "look", "think",
+           "got", "need", "want", "lot", "share", "come", "way",
+           "doing", "sure", "things", "bit", "read", "link")
+)
+```
+
+```{r req_3b}
+# remove links, @mentions and HTML artefacts, lower-case, then tidy whitespace
+posts_with_text <- posts |>
+  filter(!is.na(text), str_squish(text) != "") |>
+  mutate(
+    text_clean = text |>
+      str_to_lower() |>
+      str_replace_all("[’‘]", "'") |>
+      str_replace_all("https?://\\S+|www\\.\\S+", " ") |>
+      str_replace_all("@\\w+", " ") |>
+      str_replace_all("&amp;", " and ") |>
+      str_replace_all("#", " ") |>
+      str_squish()
+  ) |>
+  select(post_id, platform, createdAt, text_clean)
+```
+
+```{r req_3bi}
+# tokenise into one word per row (unnest_tokens() lower-cases and strips
+# punctuation automatically)
+post_words_raw <- posts_with_text |>
+  unnest_tokens(output = word, input = text_clean, token = "words")
+
+# remove standard stop words, the custom list above, and any token with a digit
+post_words <- post_words_raw |>
+  filter(!word %in% stop_words$word,
+         !word %in% additional_stopwords$word,
+         !str_detect(word, "[0-9]"),
+         str_length(word) >= 3)
+
+# how many posts were available for text analysis
+tibble(
+  measure = c("All posts", "Posts with usable text", "Posts dropped (no text)"),
+  value = c(nrow(posts), n_distinct(posts_with_text$post_id),
+            nrow(posts) - n_distinct(posts_with_text$post_id))
+) |>
+  kable(caption = "Text preparation summary")
+
+```
+
+# Data-informed insights and recommendations
+
+## Topics content creators have been posting about
+
+Term frequency shows which individual words appear most often; the LDA topic model groups words that tend to occur together into broader context. The two are complementary.
+
+```{r req_3bii}
+# count each word, then keep the 20 most frequent
+word_counts <- post_words |> count(word, sort = TRUE, name = "frequency")
+top_words <- word_counts |> slice_max(n = 20, order_by = frequency)
+
+kable(top_words, caption = "Top 20 words in Fonterra's social media content")
+
+# bar chart of the top 20 words, shaded by frequency
+top_words |>
+  mutate(word = fct_reorder(word, frequency)) |>
+  ggplot(aes(x = word, y = frequency, fill = frequency)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "#d9f2d0", high = "#1b4332", guide = "none") +
+  labs(title = "Top 20 words across Fonterra's social media content",
+       subtitle = "How often each word shows up across every platform",
+       x = NULL, y = "Number of times used") +
+  theme_minimal(base_size = 12)
+```
+
+The most common words in this word list include milk, dairy, farmers, and farm; then come team, people, food, world, business, support, products, and water. Some other common words in this list are cheese, price, China, global, and tanker. The contents of this list are not confined only to marketing of products but include many other topics.
+
+```{r req_3c}
+# drop words that are too rare (fewer than 5 posts) or too common (over half
+# of all posts) - both extremes make topics harder to interpret
+word_doc_counts <- post_words |>
+  distinct(post_id, word) |>
+  count(word, name = "n_docs")
+
+n_text_posts <- n_distinct(post_words$post_id)
+
+common_closer <- word_doc_counts |>
+  filter(n_docs >= 5, n_docs <= 0.50 * n_text_posts)
+
+input_topic_words <- post_words |>
+  inner_join(common_closer, by = "word")
+
+# build the document-term matrix that LDA() requires
+topic_dtm <- input_topic_words |>
+  count(post_id, word, name = "n") |>
+  cast_dtm(document = post_id, term = word, value = n)
+```
+
+```{r req_3ci}
+# fit a six-topic model (k = 6, as suggested in the brief); the seed in
+# control= makes it reproducible
+topic_model <- LDA(topic_dtm, k = 6, control = list(seed = 1234))
+
+# quick list of the top words per topic (no probabilities attached)
+get_terms(topic_model, 10)
+
+# word-topic probabilities, needed for the chart below
+topic_words <- tidy(topic_model, matrix = "beta") |>
+  group_by(topic) |>
+  slice_max(order_by = beta, n = 10) |>
+  ungroup()
+
+topic_words |>
+  arrange(topic, desc(beta)) |>
+  group_by(topic) |>
+  summarise(top_words = paste(term, collapse = ", "), .groups = "drop") |>
+  kable(caption = "Top words for each of the six topics")
+```
+
+```{r req_3cii}
+# bar chart of the top words per topic, one colour per topic
+topic_words |>
+  ggplot(aes(x = beta, y = reorder_within(x = term, by = beta, within = topic),
+             fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  scale_y_reordered() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(subtitle = "Top 10 highest-probability words per LDA topic",
+       x = "Word-topic probability (beta)", y = NULL) +
+  theme_minimal(base_size = 10)
+
+# ---- Word cloud of the 80 most frequent words ----
+set.seed(2026)
+wordcloud(words = word_counts$word, freq = word_counts$frequency, max.words = 80, random.order = FALSE,
+          scale = c(3.5, 0.6), colors = RColorBrewer::brewer.pal(8, "Dark2"))
+
+```
+
+```{r req_3d}
+# assign each post its single most likely topic, with the model's confidence
+post_topics <- tidy(topic_model, matrix = "gamma") |>
+  group_by(document) |>
+  slice_max(gamma, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(post_id = as.integer(as.character(document)), topic, topic_confidence = gamma)
+
+# share of posts falling into each topic
+post_topics |>
+  count(topic, name = "posts") |>
+  mutate(pct = round(100 * posts / sum(posts), 1)) |>
+  kable(caption = "Share of posts falling into each topic")
+```
+
+### Commentary on topic insights
+
+The following six themes have been developed based on the most frequent words of each topic (numbers are random, hence description needs to be confirmed using the table “Top words for each of the six topics” on each knit). The first topic deals with business and pricing (price, million, China, strong, forecast); the second topic deals with products and nutrition (products, cream, nutrition, cheese, protein); the third topic deals with community and schools (support, school, community, kids, communities); the fourth topic deals with awards and industry recognition (awards, congratulations, industry, agchatnz) and captures milk tanker posts; the fifth topic deals with farming and environment (farm, water, cows, farming, environment); the sixth topic deals with team, events and site activity (team, site, event, Christmas, GDT, global) and is the biggest topic capturing 20.6% of the posts. The sixth topic is rather indistinctive, and words like “music” (topic 5) and “john” (topic 1) are ambiguous. Topic sizes are fairly balanced (12.4% to 20.6%). In this dataset, the most prominent topics extend beyond direct product-related content and include business, community, industry recognition, farming and events.
+
+## Level of user engagement and factors that influence user engagement
+
+The `likeCount` can be applied to every single post, and therefore, it is considered a main dependent variable for cross-platform comparison. The comments, shares, and videos played are counted where possible; however, they cannot be considered a directly comparable variable due to lack of data on some platforms.
+
+```{r req_3di}
+# Summarise engagement statistics by platform
+safe_median <- function(x) if (all(is.na(x))) NA_real_ else median(x, na.rm = TRUE)
+
+platform_engagement <- posts |>
+  group_by(platform) |>
+  summarise(
+    posts           = n(),
+    median_likes    = median(likeCount, na.rm = TRUE),
+    iqr_likes       = IQR(likeCount, na.rm = TRUE),
+    median_comments = safe_median(commentCount),
+    median_shares   = safe_median(shareCount),
+    median_plays    = safe_median(videoplayCount),
+    .groups = "drop"
+  )
+
+platform_engagement |>
+  kable(digits = 1, caption = "Engagement by platform - descriptive statistics")
+```
+
+```{r req_3dii}
+# distribution of likes per post (log scale) - shows the heavy right skew
+posts |>
+  ggplot(aes(x = likeCount + 1)) +
+  geom_histogram(bins = 40, fill = "#225ea8") +
+  scale_x_log10() +
+  labs(title = "Distribution of likes per post",
+       subtitle = "Log scale; most posts receive few likes",
+       x = "Likes + 1 (log scale)", y = "Number of posts") +
+  theme_minimal(base_size = 11)
+```
+
+Most posts receive very few likes, while a small number receive many, so the distribution is strongly right-skewed. This is why medians and non-parametric tests are used.
+
+```{r req_3e}
+# posting volume over time by platform
+posts |>
+  count(post_year, platform) |>
+  ggplot(aes(x = post_year, y = n, fill = platform)) +
+  geom_col() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Number of posts per year by platform",
+       x = "Year", y = "Posts", fill = "Platform") +
+  theme_minimal(base_size = 10)
+```
+
+Twitter/X accounts for most of the posts in the dataset (6,220 of 9,001), so overall posting volume is largely driven by this platform.
+
+```{r req_3ei}
+#plot_engagement_by_platform
+# boxplot of engagement by platform; log10(1 + likes) keeps a handful of
+# viral posts from squashing the rest of the distribution
+posts |>
+  ggplot(aes(x = fct_reorder(platform, likeCount, .fun = median), y = log10(likeCount + 1),
+             fill = platform)) +
+  geom_boxplot(outlier.alpha = 0.25, show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_brewer(palette = "Blues") +
+  labs(title = "Engagement by platform",
+       subtitle = "log10(1 + likes) per post, so a few viral posts don't hide everything else",
+       x = NULL, y = "log10(1 + likes)") +
+  theme_minimal(base_size = 11)
+```
+
+```{r req_3eii}
+# boxplot of engagement by media type - only Facebook, Instagram and
+# LinkedIn vary their media type in this dataset
+posts |>
+  filter(platform %in% c("Facebook", "Instagram", "LinkedIn")) |>
+  ggplot(aes(x = post_media, y = log10(likeCount + 1), fill = post_media)) +
+  geom_boxplot(outlier.alpha = 0.25) +
+  facet_wrap(~ platform) +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(title = "Engagement by media type",
+       subtitle = "Not recorded vs. image vs. video vs. sidecar, log10(1 + likes)",
+       x = NULL, y = "log10(1 + likes)", fill = "Media type") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+```{r req_3_a}
+#plot_length_vs_engagement
+# scatter plot of caption length vs. likes; both axes logged since both
+# variables are right-skewed
+posts |>
+  ggplot(aes(x = word_count + 1, y = likeCount + 1, colour = platform)) +
+  geom_point(alpha = 0.35) +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_colour_brewer(palette = "Set1") +
+  labs(title = "Post length vs. engagement",
+       subtitle = "Caption word count against likes (log-log scale), by platform",
+       x = "Words in the post (log scale)", y = "Likes (log scale)", colour = "Platform") +
+  theme_minimal(base_size = 11)
+```
+
+```{r req_3_b}
+# boxplot of engagement by topic, linking Part 3(a)'s topics to Part 3(b)'s
+# engagement question
+posts |>
+  left_join(post_topics, by = "post_id") |>
+  filter(!is.na(topic)) |>
+  ggplot(aes(x = factor(topic), y = log10(likeCount + 1), fill = factor(topic))) +
+  geom_boxplot(outlier.alpha = 0.25, show.legend = FALSE) +
+  scale_fill_brewer(palette = "Blues") +
+  labs(title = "Engagement by topic",
+       subtitle = "Does what a post is about relate to how well it does? (log10(1 + likes))",
+       x = "Topic", y = "log10(1 + likes)") +
+  theme_minimal(base_size = 11)
+```
+
+Prior to selecting any tests, the assumptions of normality (using Shapiro-Wilk test on each platform, but reducing sample size to 5,000 for those platforms which have more data since shapiro.test() can handle maximum 5,000 observations) and equality of variance (using rstatix::levene_test()) have been verified for the platform test while the assumption of Levene's test has been verified for the hashtag test.
+
+```{r req_3_c}
+#bivariate_setup
+# posts joined to their topic, and posts with video-play data - both reused below
+posts_with_topic  <- posts |> left_join(post_topics, by = "post_id") |> filter(!is.na(topic)) |>
+  mutate(topic = factor(topic))
+videos_with_plays <- posts |> filter(!is.na(videoplayCount))
+
+# log(1 + likes) column used for the normality/variance checks and the ANOVA
+posts_log <- posts |> mutate(log_likes = log10(likeCount + 1))
+```
+
+```{r req_3_d}
+# Shapiro-Wilk normality check, per platform (sampled to 5,000 rows where
+# needed, since Twitter/X alone has over 6,000 posts)
+posts_log |>
+  group_by(platform) |>
+  group_map(~ {
+    vals <- .x$log_likes
+    if (length(vals) > 5000) vals <- sample(vals, 5000)
+    test <- shapiro.test(vals)
+    tibble(platform = unique(.y$platform), n = length(.x$log_likes),
+           W = unname(test$statistic), p_value = test$p.value)
+  }) |>
+  bind_rows() |>
+  kable(digits = 3, caption = "Shapiro-Wilk normality check, log(1 + likes) by platform")
+
+# homogeneity-of-variance check
+posts_log |> mutate(platform = factor(platform)) |> levene_test(log_likes ~ platform)
+```
+
+Facebook and LinkedIn approach normality (p \> .05), whereas Instagram, TikTok, Twitter/X, and YouTube deviate from normal (p \< .001), with significant differences between variances for the different platforms (Levene's test, p \< .001). Hence, the Kruskal-Wallis outcome is considered the primary finding, with ANOVA included as well.
+
+```{r req_3_e}
+# one-way ANOVA (parametric) with Tukey's HSD post-hoc
+anova_platform <- aov(log_likes ~ platform, data = posts_log)
+summary(anova_platform)
+
+as.data.frame(TukeyHSD(anova_platform)$platform) |>
+  round(3) |>
+  kable(caption = "Tukey's HSD - pairwise platform differences")
+
+# Kruskal-Wallis (non-parametric equivalent) with Dunn's test as post-hoc
+platform_test <- kruskal.test(likeCount ~ platform, data = posts)
+platform_test
+
+dunn_test(posts, likeCount ~ platform, p.adjust.method = "bonferroni") |>
+  select(group1, group2, statistic, p.adj, p.adj.signif)
+```
+
+```{r req_3_f}
+# chi-squared test: is media type linked to being above/below the platform's
+# own median engagement? Restricted to Facebook, Instagram and LinkedIn,
+# the only platforms where media type varies
+posts_media <- posts |>
+  filter(platform %in% c("Facebook", "Instagram", "LinkedIn")) |>
+  group_by(platform) |>
+  mutate(high_engagement = likeCount > median(likeCount)) |>
+  ungroup()
+
+chi_table1 <- table(posts_media$post_media, posts_media$high_engagement)
+chi_table1
+
+chisq.test(chi_table1)$expected   # check: all expected counts should be at least 5
+chisq.test(chi_table1)
+chisq.test(chi_table1)$stdres
+
+```
+
+```{r req_3_g}
+# hashtag use and median likes, by platform
+posts |>
+  group_by(platform) |>
+  summarise(pct_hashtag = round(100 * mean(has_hashtag), 1),
+            median_with = median(likeCount[has_hashtag]),
+            median_without = median(likeCount[!has_hashtag]),
+            .groups = "drop") |>
+  kable(caption = "Hashtag use and median likes by platform")
+# does hashtag use relate to engagement? two groups, so a t-test /
+# Mann-Whitney U comparison
+posts_log |> mutate(has_hashtag = factor(has_hashtag)) |> levene_test(log_likes ~ has_hashtag)
+
+t.test(log_likes ~ has_hashtag, data = posts_log)        # Welch's t-test (parametric)
+wilcox.test(log_likes ~ has_hashtag, data = posts_log)   # Mann-Whitney U (non-parametric)
+```
+
+```{r req_3_h}
+# median likes per topic, to show direction
+posts_with_topic |>
+  group_by(topic) |>
+  summarise(posts = n(), median_likes = median(likeCount), .groups = "drop") |>
+  kable(caption = "Median likes by topic")
+# likes across the six topics - Kruskal-Wallis with Dunn's test as post-hoc
+topic_test <- kruskal.test(likeCount ~ topic, data = posts_with_topic)
+topic_test
+
+dunn_test(posts_with_topic, likeCount ~ topic, p.adjust.method = "bonferroni") |>
+  filter(p.adj < 0.05) |>
+  select(group1, group2, statistic, p.adj, p.adj.signif)
+```
+
+```{r req_4_a}
+# post length vs likes within each platform
+posts |>
+  group_by(platform) |>
+  summarise(rho = round(cor(word_count, likeCount, method = "spearman"), 2),
+            .groups = "drop") |>
+  kable(caption = "Spearman rho: word count vs likes, by platform")
+
+# correlation matrix across the engagement metrics and post length,
+# visualised as a correlogram
+posts |>
+  select(likeCount, commentCount, shareCount, videoplayCount, word_count) |>
+  cor(method = "spearman", use = "pairwise.complete.obs") |>
+  corrplot(type = "upper", tl.col ="black", addCoef.col ="black", number.cex = 0.9,
+           col= colorRampPalette(c("#d73027", "white", "#1a9850")) (200),
+           title = "Spearman correlations: engagement metrics and post length", mar = c (0,0,2,9))
+
+# video plays vs. likes specifically
+plays_likes_test <- cor.test(videos_with_plays$videoplayCount, videos_with_plays$likeCount,
+                              method = "spearman", exact = FALSE)
+plays_likes_test
+```
+
+```{r req_4_b}
+#bivariate_summary
+# summary table of the headline result from each test
+tibble(
+  analysis = c("Likes by platform (Kruskal-Wallis)",
+               "Likes by media type, high vs. low engagement (chi-squared)",
+               "Likes by hashtag use (Mann-Whitney U)",
+               "Likes by topic (Kruskal-Wallis)",
+               "Post length vs. likes (Spearman)",
+               "Video plays vs. likes (Spearman)"),
+  statistic = c(paste0("H = ", round(unname(platform_test$statistic), 2)),
+                paste0("X-squared = ", round(unname(chisq.test(chi_table1)$statistic), 2)),
+                paste0("W = ", format(unname(wilcox.test(log_likes ~ has_hashtag, data = posts_log)$statistic), big.mark = ",")),
+                paste0("H = ", round(unname(topic_test$statistic), 2)),
+                paste0("rho = ", round(unname(cor.test(posts$word_count, posts$likeCount, method = "spearman", exact = FALSE)$estimate), 3)),
+                paste0("rho = ", round(unname(plays_likes_test$estimate), 3))),
+  p_value = c(platform_test$p.value,
+              chisq.test(chi_table1)$p.value,
+              wilcox.test(log_likes ~ has_hashtag, data = posts_log)$p.value,
+              topic_test$p.value,
+              cor.test(posts$word_count, posts$likeCount, method = "spearman", exact = FALSE)$p.value,
+              plays_likes_test$p.value)
+) |>
+  mutate(p_value = format.pval(p_value, digits = 3, eps = 0.001)) |>
+  kable(caption = "Bivariate test results - summary")
+```
+
+### Commentary on engagement insights and recommendations
+
+There are many more outliers than one would like - some posts have huge engagement compared to the rest, which means that medians will be used to describe typical engagement. Also, whenever the results from the Kruskal-Wallis test and Mann-Whitney test differ from the results of the parametric test, they are treated as primary.
+
+**Platform.** The platforms with the highest median number of likes are LinkedIn (median = 141) and Instagram (median = 132), then Facebook (median = 61). According to both ANOVA (F = 3257, p \< .001) and the Kruskal-Wallis test (H = 4728.4, p \< .001), there are significant differences between the platforms. Post-hoc tests (Tukey and Dunn) show every pair differs significantly except Instagram vs LinkedIn and Twitter/X vs YouTube. However, it should be kept in mind that it is not an engagement-*rate* ranking - there are no measures of followers/following, reach, paid promotion and time lived in the data.
+
+**Media type.** Image and video posts on Facebook, Instagram and LinkedIn were found to be more often than expected above the median number of likes for that platform compared to posts with not recorded media type (chi-square = 36.0, df = 3, p \< .001; standardized residuals: Image +2.9, Video +3.2, Not recorded – 5.9). Sidecar posts had no significant difference. "Not recorded" refers to the media type being unknown rather than a text post, thus it gives rise to further experiments on image and video posts.
+
+**Hashtags.** For all platforms combined, there are more likes for posts with hashtags compared to those without (Mann-Whitney U, W = 6,043,194, p \< .001). However, hashtags vary across platforms, ranging from 0% on YouTube and 26–36% on Twitter/X, LinkedIn, and Facebook, to 56% on Instagram and 85% on TikTok, therefore some of the difference observed above might be attributable to the platform rather than hashtags. Looking at individual platforms, the trend is inconsistent: posts with hashtags get more likes on Facebook (median: 76 vs. 54), Instagram (154 vs. 95) and almost on Twitter/X (2 vs. 1), while less on LinkedIn (121 vs. 149) and TikTok (7 vs. 11.5). Medians above are descriptive only and have not been tested; therefore, hashtags cannot be considered an absolute engagement predictor.
+
+**Post length.** When we consider all the platforms together, we observe a moderate positive correlation between caption length and likes (Spearman rho = 0.46, p \< .001). In each platform separately, the correlation varies from -0.18 (Instagram) to 0.38 (Twitter/X): it is low but positive for Facebook (0.10), TikTok (0.10), YouTube (0.15), and LinkedIn (0.20), while it is negative for Instagram. There is variability in the strength and nature of the relationship, which indicates that platform context may be significant to understand the relationship between caption length and likes.
+
+**Video plays.** Of 886 posts with plays information, there is a strong correlation between video plays and likes (Spearman rho = 0.73, p \< .001). Again, correlation doesn't imply causation here.
+
+**Topic.** Likes vary greatly based on the topic (H for Kruskal-Wallis = 664.65, p \< .001). The topic that has the greatest median likes is Topic 3 (community and schools) with a median value of 8, followed by Topic 4 (7, awards and recognition), Topic 2 (5) and Topic 5 (4). The topics having the fewest median likes are Topic 1 (business and pricing) and Topic 6 (team and events) at 1. In Dunn's test (Bonferroni), most topic pairs showed significant differences; the non-significant pairwise differences were between Topics 2 and 5 and Topics 3 and 4. This analysis did not take into account the platforms and could also include specific platforms, so the next step would be comparing the topics in one platform over time.
+
+**Recommendations.** In future data collection, Fonterra should include reach/impressions, follower count at the time of posting, paid/organic status and more complete share and view counts so that engagement rates can be calculated and platforms can be compared more fairly. Based on the current data, the results suggest several areas for further testing: (1) develop platform-specific strategies rather than relying on one approach, because median likes differ substantially across platforms; (2) test image and video content on Facebook, Instagram and LinkedIn, where these media types were more frequently associated with above-median likes; (3) test hashtag use separately by platform, particularly on Facebook and Instagram, while recognising that the observed differences do not establish that hashtags cause higher engagement; (4) avoid relying on caption length alone as an engagement strategy because the relationship varies substantially across platforms; (5) investigate community/school and awards/recognition content further, as these topics had higher median likes in this dataset; and (6) use rate-based engagement measures once reach and follower data are available.
+
+# Declaration for Generative AI use
+
+- **AI tool:** (Copilot).
+- **Purpose of using the tool:** I used AI to outline the analysis, to write and debug R code, and to ensure my commentary corresponded to the knitted results.
+- **Amount of AI usage:** Copilot helped me to decide on which decision is important for the analysis and gave me the code as per my instruction and draft commentary. However, all the commentary and final decision were mine. I ran, reviewed, edited and made the final analytical decisions myself.
+- **Methods used to ensure accuracy:**I knitted the document to make sure it works without any errors, compared all numbers in the commentary against the knitted results, read samples of posts on each topic to verify that the topic names were correct, and understood why each statistical test was used.
